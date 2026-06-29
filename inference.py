@@ -298,7 +298,7 @@ def letterbox_resize(img, target_h=640, target_w=640):
 
     return canvas
 
-def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
+def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None, thermal_state=None):
     """Main inference loop with Hailo pipeline, MQTT publishing, and frame queuing."""
     logger.info("=" * 80)
     logger.info("Starting Hailo YOLOv5m Inference Pipeline")
@@ -631,6 +631,8 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                                 _hailo_thermal["ts0"] = round(ts0, 1)
                                 _hailo_thermal["ts1"] = round(ts1, 1)
                                 _hailo_thermal["status"] = _thermal_status(ts0, ts1)
+                                if thermal_state is not None:
+                                    thermal_state.update(_hailo_thermal)
                             except Exception:
                                 pass
 

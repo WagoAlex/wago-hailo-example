@@ -38,6 +38,7 @@ app = FastAPI(
     version="1"
 )
 global_camera_queues = None
+global_thermal_state = None
 ffmpeg_processes = {}
 feeders = {}
 stderr_loggers = {}
@@ -316,7 +317,7 @@ async def health_check(camera_queues: list[Queue] = Depends(get_camera_queues)):
         "status": status_msg,
         "cameras": statuses,
         "metadata": hailo_metadata,
-        "thermal": get_hailo_thermal(),
+        "thermal": dict(global_thermal_state) if global_thermal_state is not None else get_hailo_thermal(),
         "show_in_gui": SHOW_IN_GUI,
         "timestamp": get_current_timestamp()
     }
@@ -333,9 +334,10 @@ def shutdown_event():
     for t in stderr_loggers.values():
         t.join()
     logger.info("HLS streams shut down successfully")
-def run_api(camera_queues: list[Queue]):
-    global global_camera_queues
+def run_api(camera_queues: list[Queue], thermal_state=None):
+    global global_camera_queues, global_thermal_state
     global_camera_queues = camera_queues
+    global_thermal_state = thermal_state
     logger.info(f"Starting API with {len(camera_queues)} camera queues on port {REST_API_PORT}")
     for camera_id in range(len(camera_queues)):
         start_hls(camera_id, camera_queues[camera_id])

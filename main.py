@@ -8,7 +8,7 @@
 # - Rationale: Prevents starvation; scalable for prod (e.g., alert on low FPS via MQTT to Prometheus/Grafana).
 # Maintainability: Signal handling for clean Docker stops; processes list for easy extension.
 # Security: No privileged ops; MQTT auth if needed in config.py.
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Manager
 from config import MQTT_TOPIC, MQTT_BROKER, MQTT_PORT, RTSP_URL, QUEUE_WARN_THRESHOLD, QUEUE_DROP_THRESHOLD, QUEUE_MONITOR_INTERVAL, WARN_TOPIC, LOG_LEVEL, RTSP_URLS
 import signal
 import time
@@ -47,12 +47,15 @@ def main():
     # List to track all child processes for management and cleanup
     processes = []
     camera_queues = []  # Per-camera queues for independence and steady streaming
-    
+
+    manager = Manager()
+    thermal_state = manager.dict({"ts0": None, "ts1": None, "status": "unknown"})
+
     # Start inference processes per camera
     for idx, url in enumerate(rtsp_urls):
         camera_queue = Queue(maxsize=2)  # ponytail: tiny buffer - drop old frames, keep latest
         camera_queues.append(camera_queue)
-        p_inference = Process(target=inference.run_inference_main, args=(args.webcam, camera_queue, url.strip() if not args.webcam else None))
+        p_inference = Process(target=inference.run_inference_main, args=(args.webcam, camera_queue, url.strip() if not args.webcam else None, thermal_state))
         processes.append(p_inference)
         p_inference.start()
     
@@ -62,7 +65,7 @@ def main():
     p_mqtt.start()
     
     # Start API process with list of camera queues for multi-stream support
-    p_api = Process(target=api_app.run_api, args=(camera_queues,))
+    p_api = Process(target=api_app.run_api, args=(camera_queues, thermal_state))
     processes.append(p_api)
     p_api.start()
     
@@ -107,11 +110,11 @@ def main():
                     time.sleep(restart_delays[i])
                     if i in inference_processes_indices:
                         url = rtsp_urls[i] if not args.webcam else None
-                        new_p = Process(target=inference.run_inference_main, args=(args.webcam, camera_queues[i], url.strip() if url else None))
+                        new_p = Process(target=inference.run_inference_main, args=(args.webcam, camera_queues[i], url.strip() if url else None, thermal_state))
                     elif i == mqtt_process_index:
                         new_p = Process(target=mqtt_app.run_mqtt)
                     elif i == api_process_index:
-                        new_p = Process(target=api_app.run_api, args=(camera_queues,))
+                        new_p = Process(target=api_app.run_api, args=(camera_queues, thermal_state))
                     else:
                         continue  # Unknown process—skip
                     processes[i] = new_p
