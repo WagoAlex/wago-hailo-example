@@ -115,7 +115,7 @@ logger.info(f"Extracted base model name: '{base_model_name}' from HEF: {os.path.
 
 def get_current_timestamp():
     """Returns the current timestamp in milliseconds."""
-    return int(datetime.utcnow().timestamp() * 1000)
+    return int(time.time() * 1000)  # ponytail: datetime.utcnow().timestamp() is wrong in non-UTC containers
 
 def get_hailo_metadata() -> dict:
     """Extracts metadata from Hailo device using hailortcli command."""
@@ -135,8 +135,8 @@ def get_hailo_metadata() -> dict:
 def decode_output(output, stride, anchors):
     """Decodes YOLOv5m output into bounding boxes, confidences, and class IDs."""
     if output.dtype == np.uint8:
-       output = (output.astype(np.float32) - 128.0) / 16.0  # Better resolution when calibrating sigmoid manually 
-       logger.debug(f"Output range after dequant: [{output.min():.2f}, {output.max():.2f}]")
+        output = (output.astype(np.float32) - 128.0) / 16.0
+    logger.debug(f"Output range: [{output.min():.4f}, {output.max():.4f}] dtype={output.dtype}")
 
     if len(output.shape) == 4:
         output = np.squeeze(output, axis=0)
@@ -165,8 +165,8 @@ def decode_output(output, stride, anchors):
 
     x = (tx * 2 - 0.5 + cx) * stride
     y = (ty * 2 - 0.5 + cy) * stride
-    w = (tw * 2) ** 2 * np.array(anchors)[:, 0].reshape(1, 1, num_anchors) * stride
-    h = (th * 2) ** 2 * np.array(anchors)[:, 1].reshape(1, 1, num_anchors) * stride
+    w = (tw * 2) ** 2 * np.array(anchors)[:, 0].reshape(1, 1, num_anchors)  # ponytail: anchors already in pixels, stride is for x/y grid→pixel only
+    h = (th * 2) ** 2 * np.array(anchors)[:, 1].reshape(1, 1, num_anchors)
 
     x1, y1 = x - w / 2, y - h / 2
     x2, y2 = x + w / 2, y + h / 2
@@ -191,26 +191,34 @@ def decode_output(output, stride, anchors):
     detections = detections[
         (box_widths < MAX_BOX_SIZE) &
         (box_heights < MAX_BOX_SIZE) &
-        (box_widths > 20) &  # Also filter tiny boxes
+        (box_widths > 20) &
         (box_heights > 20)
     ]
+
+    # ponytail: filter edge-clipped artifacts - letterbox padding activates helmet filters
+    # at frame boundaries producing tiny high-confidence ghost boxes. Real objects have
+    # substantial size even when touching the edge (real helmet clipped at top: height≈76px).
+    if len(detections):
+        x1, y1 = detections[:, 0], detections[:, 1]
+        x2, y2 = detections[:, 2], detections[:, 3]
+        w = x2 - x1; h = y2 - y1
+        edge = 8  # px tolerance
+        at_lr = (x1 < edge) | (x2 > FRAME_WIDTH - edge)
+        at_tb = (y1 < edge) | (y2 > FRAME_HEIGHT - edge)
+        ghost = (at_lr & (w < 60)) | (at_tb & (h < 60))
+        detections = detections[~ghost]
 
     return detections
 
 def publish_inference_data(client, data):
-    """Publishes inference data to MQTT topic with exponential backoff retry."""
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            if not client.is_connected():
-                client.reconnect()
-                time.sleep(0.5)
-            client.publish(MQTT_TOPIC, json.dumps(data))
-            return
-        except Exception as e:
-            if attempt == max_retries - 1:
-                logger.error(f"MQTT publish failed: {type(e).__name__}")
-            time.sleep(0.5 * (2 ** attempt))
+    """Publishes inference data to MQTT topic and flushes immediately for <20ms latency."""
+    try:
+        if not client.is_connected():
+            client.reconnect()
+        client.publish(MQTT_TOPIC, json.dumps(data))
+        client.loop_write()  # ponytail: force socket flush instead of waiting for background loop (~100ms)
+    except Exception as e:
+        logger.error(f"MQTT publish failed: {type(e).__name__}")
 
 def filter_by_iou(detections, iou_threshold):
     """Custom post-NMS IoU filter to further reduce overlapping boxes."""
@@ -541,6 +549,9 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                     detection_count_window = 0
                     latest_confidence = 0.0
                     max_confidence_window = 0.0
+                    # ponytail: per-class EMA tracker {class_id: [[x1,y1,x2,y2], ...]}
+                    SMOOTH_ALPHA = 0.35  # ponytail: tune lower for smoother, higher for more responsive
+                    tracked: dict[int, list] = {}
 
                     placeholder_frame = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), np.uint8)
                     cv2.putText(placeholder_frame, "Waiting for frames...", (50, FRAME_HEIGHT // 2),
@@ -568,6 +579,11 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                             results = infer_pipeline.infer(input_data)
                         except Exception as e:
                             logger.error(f"Inference failed: {type(e).__name__}")
+                            if 'Timeout' in type(e).__name__ or 'TIMEOUT' in str(e):
+                                # ponytail: break exits InferVStreams context (reinitializes pipeline buffers);
+                                # continue retries with stuck pipeline → infinite 10s timeout loop
+                                logger.warning("Hailo pipeline stuck - reinitializing")
+                                break
                             continue
 
                         all_detections = []
@@ -617,13 +633,62 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                             max_confidence_window = 0.0
 
                         if filtered_detections.size > 0:
-                            boxes = filtered_detections[:, :4].tolist()
-                            scores = filtered_detections[:, 4].tolist()
-                            indices = cv2.dnn.NMSBoxes(boxes, scores, CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD)
-
+                            indices = cv2.dnn.NMSBoxes(filtered_detections[:, :4].tolist(), filtered_detections[:, 4].tolist(), CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD)
                             if len(indices) > 0:
                                 final_detections = filtered_detections[indices.flatten()]
                                 final_detections = filter_by_iou(final_detections, IOU_THRESHOLD)
+
+                                # centroid dedup: same object detected by multiple stride layers → keep highest confidence
+                                # ponytail: IoU alone fails across strides (32px vs 128px boxes have low IoU even on same object)
+                                final_detections = final_detections[np.argsort(final_detections[:, 4])[::-1]]
+                                keep_mask = np.ones(len(final_detections), dtype=bool)
+                                for i in range(len(final_detections)):
+                                    if not keep_mask[i]:
+                                        continue
+                                    cx_i = (final_detections[i, 0] + final_detections[i, 2]) / 2
+                                    cy_i = (final_detections[i, 1] + final_detections[i, 3]) / 2
+                                    for j in range(i + 1, len(final_detections)):
+                                        if not keep_mask[j]:
+                                            continue
+                                        cx_j = (final_detections[j, 0] + final_detections[j, 2]) / 2
+                                        cy_j = (final_detections[j, 1] + final_detections[j, 3]) / 2
+                                        dist = ((cx_i - cx_j) ** 2 + (cy_i - cy_j) ** 2) ** 0.5
+                                        if dist < FRAME_WIDTH * 0.25:  # ponytail: 25%=160px catches same-toy multi-class (helmet+head on playmobil)
+                                            keep_mask[j] = False
+                                final_detections = final_detections[keep_mask]
+
+                                # ponytail: top-1 per class - model fires on multiple non-overlapping grid cells
+                                # for the same physical object; IoU-NMS can't suppress 0-overlap boxes.
+                                # Different classes still produce separate boxes (red+blue = 2 boxes).
+                                seen_classes: dict[int, np.ndarray] = {}
+                                for det in final_detections:  # already sorted conf desc
+                                    cid = int(det[5])
+                                    if cid not in seen_classes:
+                                        seen_classes[cid] = det
+                                final_detections = np.array(list(seen_classes.values())) if seen_classes else np.zeros((0, 6))
+
+                                # ponytail: class-agnostic NMS - multiple classes fire on same object
+                                # (red+yellow+blue helmet all on same playmobil). Keep highest-conf per spatial region.
+                                if len(final_detections) > 1:
+                                    final_detections = final_detections[np.argsort(final_detections[:, 4])[::-1]]
+                                    keep = np.ones(len(final_detections), dtype=bool)
+                                    for i in range(len(final_detections)):
+                                        if not keep[i]:
+                                            continue
+                                        for j in range(i + 1, len(final_detections)):
+                                            if not keep[j]:
+                                                continue
+                                            b1, b2 = final_detections[i, :4], final_detections[j, :4]
+                                            ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
+                                            ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
+                                            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+                                            union = (b1[2]-b1[0])*(b1[3]-b1[1]) + (b2[2]-b2[0])*(b2[3]-b2[1]) - inter
+                                            if union > 0 and inter / union > 0.1:  # ponytail: 0.1=any meaningful overlap merges; 2 people far apart have IoU≈0
+                                                keep[j] = False
+                                    final_detections = final_detections[keep]
+
+                                if len(final_detections) > 10:
+                                    final_detections = final_detections[:10]
 
                                 num_dets = len(final_detections)
                                 detection_count_total += num_dets
@@ -634,24 +699,50 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                                     current_max = float(np.max(final_detections[:, 4]))
                                     max_confidence_window = max(max_confidence_window, current_max)
 
+                                new_tracked: dict[int, list] = {}
                                 for det in final_detections:
-                                    box, score, class_id = det[:4], det[4], int(det[5])
+                                    raw_box, score, class_id = det[:4], det[4], int(det[5])
+                                    cid = class_id
+                                    cx = (raw_box[0] + raw_box[2]) / 2
+                                    cy = (raw_box[1] + raw_box[3]) / 2
+                                    # match to closest existing tracked box of same class
+                                    prev_boxes = tracked.get(cid, [])
+                                    best_idx, best_dist = -1, float('inf')
+                                    for pi, pb in enumerate(prev_boxes):
+                                        pcx = (pb[0] + pb[2]) / 2
+                                        pcy = (pb[1] + pb[3]) / 2
+                                        d = (cx - pcx) ** 2 + (cy - pcy) ** 2
+                                        if d < best_dist:
+                                            best_dist, best_idx = d, pi
+                                    if best_idx >= 0 and best_dist < (FRAME_WIDTH * 0.3) ** 2:
+                                        prev = np.array(prev_boxes[best_idx])
+                                        box = SMOOTH_ALPHA * np.array(raw_box) + (1 - SMOOTH_ALPHA) * prev
+                                        prev_boxes.pop(best_idx)
+                                    else:
+                                        box = np.array(raw_box)
+                                    new_tracked.setdefault(cid, []).append(box.tolist())
                                     x1, y1, x2, y2 = [int(v) for v in box]
-                                    label = f"{class_names[class_id]}: {(score * 100):.1f}%"
+                                    label = f"{class_names[cid]}: {(score * 100):.1f}%"
                                     cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
                                     cv2.putText(annotated, label, (x1, max(y1 - 10, 20)),
                                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                tracked = new_tracked
 
-                                if frame_count % 100 == 0:
-                                    inference_data = {
-                                        "timestamp": get_current_timestamp(),
-                                        "detections": [
-                                            {"class": class_names[int(class_id)], "confidence": round(float(score), 2), "box": [float(x) for x in box]}
-                                            for box, score, class_id in zip(final_detections[:, :4], final_detections[:, 4], final_detections[:, 5])
-                                        ],
-                                        "fps": round(fps, 2)
-                                    }
-                                    publish_inference_data(client, inference_data)
+                                inference_data = {
+                                    "timestamp": get_current_timestamp(),
+                                    "detections": [
+                                        {"class": class_names[int(d[5])], "confidence": round(float(d[4]), 2), "box": [round(float(x), 1) for x in d[:4]]}
+                                        for d in final_detections
+                                    ],
+                                    "fps": round(fps, 2)
+                                }
+                                publish_inference_data(client, inference_data)
+                            else:
+                                tracked.clear()
+                                publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2)})
+                        else:
+                            tracked.clear()
+                            publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2)})
 
                         if SHOW_IN_GUI:
                             cv2.imshow("Inference", annotated)

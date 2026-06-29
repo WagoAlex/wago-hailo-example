@@ -2,7 +2,7 @@ import os
 SHOW_IN_GUI = int(os.environ.get("SHOW_IN_GUI", "0"))
 FRAME_WIDTH = int(os.environ.get("FRAME_WIDTH", 640))
 FRAME_HEIGHT = int(os.environ.get("FRAME_HEIGHT", 640))
-CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.42))
+CONFIDENCE_THRESHOLD = float(os.environ.get("CONFIDENCE_THRESHOLD", 0.70))  # ponytail: valid dets=88-93%, noise=60-65%, 0.70 cuts all noise
 MQTT_BROKER = os.environ.get("MQTT_BROKER", "192.168.2.181")
 MQTT_PORT = int(os.environ.get("MQTT_PORT", 1883))
 MQTT_TOPIC = os.environ.get("MQTT_TOPIC", "inference/yolov5m-results")
@@ -29,8 +29,8 @@ QUEUE_DROP_THRESHOLD = int(os.environ.get("QUEUE_DROP_THRESHOLD", 1800))
 QUEUE_MONITOR_INTERVAL = float(os.environ.get("QUEUE_MONITOR_INTERVAL", 30.0))
 WARN_TOPIC = os.environ.get("WARN_TOPIC", "inference/warnings")
 USE_GSTREAMER = int(os.environ.get("USE_GSTREAMER", 1)) # Toggle GStreamer (1=on, 0=FFmpeg only)
-IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", 0.45)) # For post-NMS filter if needed
-NMS_IOU_THRESHOLD = float(os.environ.get("NMS_IOU_THRESHOLD", 0.4)) # For cv2.dnn.NMSBoxes
+IOU_THRESHOLD = float(os.environ.get("IOU_THRESHOLD", 0.15)) # ponytail: tight - suppress multi-stride duplicates for same object
+NMS_IOU_THRESHOLD = float(os.environ.get("NMS_IOU_THRESHOLD", 0.15)) # ponytail: tight - one box per object
 FRAME_MAX = float(os.environ.get("FRAME_MAX", 0.5)) # For capping max detection frame size 
 LOG_LEVEL = os.environ.get('LOG_LEVEL', 'INFO').upper()
 
