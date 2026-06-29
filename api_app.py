@@ -1,6 +1,7 @@
 from multiprocessing import Lock
 from fastapi import FastAPI, HTTPException, Depends, Query
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
+import asyncio
 import uvicorn
 import subprocess
 import re
@@ -252,6 +253,29 @@ async def video_feed(camera_id: int = 0, camera_queues: list[Queue] = Depends(ge
     except Exception as e:
         logger.error(f"Error in video_feed for camera {camera_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Internal error in video stream: {str(e)}. Check container logs for traceback.")
+@app.get("/stream/mjpeg/{camera_id}")
+async def mjpeg_stream(camera_id: int):
+    queues = global_camera_queues
+    if not queues or camera_id >= len(queues):
+        raise HTTPException(status_code=404, detail="Camera not found")
+    q = queues[camera_id]
+    async def generate():
+        loop = asyncio.get_event_loop()
+        # drain any stale frames so first frame shown is live
+        while True:
+            try:
+                q.get_nowait()
+            except Exception:
+                break
+        while True:
+            try:
+                frame = await loop.run_in_executor(None, lambda: q.get(timeout=0.05))
+            except Exception:
+                continue
+            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+            yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
+    return StreamingResponse(generate(), media_type='multipart/x-mixed-replace; boundary=frame')
+
 @app.get("/video/{segment_name:path}")
 async def get_segment(segment_name: str, camera_id: int = Query(0)):
     logger.info(f"Received request for /video/{segment_name} - camera_id: {camera_id}")

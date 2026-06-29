@@ -50,7 +50,7 @@ def main():
     
     # Start inference processes per camera
     for idx, url in enumerate(rtsp_urls):
-        camera_queue = Queue(maxsize=5000)  # Per-camera buffer
+        camera_queue = Queue(maxsize=2)  # ponytail: tiny buffer - drop old frames, keep latest
         camera_queues.append(camera_queue)
         p_inference = Process(target=inference.run_inference_main, args=(args.webcam, camera_queue, url.strip() if not args.webcam else None))
         processes.append(p_inference)
