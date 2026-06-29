@@ -28,11 +28,14 @@ COPY api_app.py /local/workspace/api_app.py
 COPY config.py /local/workspace/config.py
 COPY mqtt_app.py /local/workspace/mqtt_app.py
 COPY entrypoint.sh /local/workspace/entrypoint.sh
-COPY yolov5m-helmet-wago.hef /local/workspace/yolov5m-helmet-wago.hef
-COPY yolov5m-helmet.hef /local/workspace/yolov5m-helmet.hef
-COPY yolov5-helmet.onnx /local/workspace/yolov5-helmet.onnx
+COPY hef/yolov5m-helmet-wago.hef /local/workspace/yolov5m-helmet-wago.hef
+COPY hef/yolov5m-helmet.hef /local/workspace/yolov5m-helmet.hef
+COPY hef/yolov5m-helmet-wago_20251014_183320.hef /local/workspace/yolov5m-helmet-wago_20251014_183320.hef
+COPY onnx/yolov5-helmet.onnx /local/workspace/yolov5-helmet.onnx
 COPY inference.py /local/workspace/inference.py
-COPY wago.jpeg /local/workspace/share/wago.jpeg
+RUN mkdir -p /local/workspace/share && \
+    convert -size 640x480 xc:gray /local/workspace/share/wago.jpeg 2>/dev/null || \
+    python3 -c "import numpy as np, cv2; cv2.imwrite('/local/workspace/share/wago.jpeg', np.full((480,640,3),128,dtype=np.uint8))"
 
 # Ensure entrypoint.sh is executable
 RUN chmod +x /local/workspace/entrypoint.sh
