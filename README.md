@@ -17,18 +17,19 @@ Real-time helmet detection on a WAGO device using a Hailo-8 AI accelerator, YOLO
 └──────┬───────────────┬──────────────────┬───────────┘
        │               │                  │
        ▼               ▼                  ▼
-┌────────────┐  ┌────────────┐  ┌──────────────────┐
-│inference.py│  │ mqtt_app.py│  │   api_app.py      │
-│            │  │            │  │                   │
-│ Hailo-8    │  │ Subscribes │  │ FastAPI server    │
-│ pipeline   │  │ to MQTT    │  │ /health           │
-│ YOLOv5m    │  │ inference  │  │ /metadata         │
-│ decode     │  │ topic      │  │ /video/stream     │
-│ IoU filter │  │            │  │ /video/segment    │
-│ MQTT pub   │  │            │  │ HLS via FFmpeg    │
-└──────┬─────┘  └────────────┘  └──────────────────┘
-       │  frames via per-camera Queue
-       └──────────────────────────────▶ HLS segments
+┌────────────┐  ┌────────────┐  ┌──────────────────────┐
+│inference.py│  │ mqtt_app.py│  │   api_app.py          │
+│            │  │            │  │                       │
+│ Hailo-8    │  │ Subscribes │  │ FastAPI server        │
+│ pipeline   │  │ to MQTT    │  │ /health               │
+│ YOLOv5m    │  │ inference  │  │ /metadata             │
+│ decode     │  │ topic      │  │ /video/stream  (HLS)  │
+│ IoU filter │  │            │  │ /video/segment (HLS)  │
+│ MQTT pub   │  │            │  │ /stream/mjpeg  (live) │
+└──────┬─────┘  └────────────┘  └──────────────────────┘
+       │  annotated frames via per-camera Queue (maxsize=2)
+       ├──────────────────────────────▶ HLS segments (FFmpeg)
+       └──────────────────────────────▶ MJPEG stream (direct)
 ```
 
 **Data flow per frame:**
@@ -38,9 +39,9 @@ Real-time helmet detection on a WAGO device using a Hailo-8 AI accelerator, YOLO
 3. Raw output decoded: sigmoid, anchor grid, bbox decode
 4. IoU post-filter removes overlapping boxes
 5. Result published to MQTT (`inference/yolov5m-results`)
-6. Annotated frame pushed to per-camera `Queue`
-7. HLS feeder thread reads queue, pipes frames to FFmpeg
-8. Client polls `/video/stream/{camera_id}` for `.m3u8`
+6. Annotated frame (bounding boxes drawn) pushed to per-camera `Queue` (maxsize=2)
+7. **MJPEG:** client reads directly from queue via `/stream/mjpeg/{camera_id}` - ~1-3s latency
+8. **HLS:** feeder thread pipes frames to FFmpeg, client polls `/video/stream/{camera_id}` for `.m3u8` - ~10-15s latency
 
 ---
 
@@ -135,17 +136,28 @@ Base URL: `http://192.168.2.124:8042`
 |---|---|---|
 | `/health` | GET | Liveness check + Hailo device metadata |
 | `/metadata` | GET | Full Hailo firmware metadata |
+| `/stream/mjpeg/{camera_id}` | GET | MJPEG live stream (~1-3s latency) |
 | `/video/stream/{camera_id}` | GET | HLS playlist (`.m3u8`) for camera N |
 | `/video/segment/{camera_id}/{segment}` | GET | Individual HLS `.ts` segment |
 | `/inference` | GET | Inference status (data delivered via MQTT) |
 
-Example:
+### Stream modes
 
+**MJPEG** (recommended for live monitoring):
 ```bash
+# Browser or VLC - annotated frames, ~1-3s latency
+curl http://192.168.2.124:8042/stream/mjpeg/0 --output stream.mjpeg
+vlc http://192.168.2.124:8042/stream/mjpeg/0
+```
+
+**HLS** (buffered, compatible with all players):
+```bash
+# Play stream in VLC or any HLS-capable player
 curl http://192.168.2.124:8042/health
-# Play stream in VLC or any HLS-capable player:
 vlc http://192.168.2.124:8042/video/stream/0
 ```
+
+Both modes serve frames with bounding boxes already drawn by the inference pipeline. The MJPEG endpoint drains any queued backlog on connect so the first frame shown is always live.
 
 ---
 
