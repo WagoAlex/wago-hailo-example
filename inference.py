@@ -679,60 +679,55 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                             else:
                                 final_detections = np.zeros((0, 6))
 
-                                num_dets = len(final_detections)
-                                detection_count_total += num_dets
-                                detection_count_window += num_dets
+                            num_dets = len(final_detections)
+                            detection_count_total += num_dets
+                            detection_count_window += num_dets
 
-                                if num_dets > 0:
-                                    latest_confidence = float(final_detections[-1][4])
-                                    current_max = float(np.max(final_detections[:, 4]))
-                                    max_confidence_window = max(max_confidence_window, current_max)
+                            if num_dets > 0:
+                                latest_confidence = float(final_detections[-1][4])
+                                current_max = float(np.max(final_detections[:, 4]))
+                                max_confidence_window = max(max_confidence_window, current_max)
 
-                                new_tracked: dict[int, list] = {}
-                                for det in final_detections:
-                                    raw_box, score, class_id = det[:4], det[4], int(det[5])
-                                    cid = class_id
-                                    cx = (raw_box[0] + raw_box[2]) / 2
-                                    cy = (raw_box[1] + raw_box[3]) / 2
-                                    # match to closest existing tracked box of same class
-                                    prev_boxes = tracked.get(cid, [])
-                                    best_idx, best_dist = -1, float('inf')
-                                    for pi, pb in enumerate(prev_boxes):
-                                        pcx = (pb[0] + pb[2]) / 2
-                                        pcy = (pb[1] + pb[3]) / 2
-                                        d = (cx - pcx) ** 2 + (cy - pcy) ** 2
-                                        if d < best_dist:
-                                            best_dist, best_idx = d, pi
-                                    if best_idx >= 0 and best_dist < (FRAME_WIDTH * 0.3) ** 2:
-                                        prev = np.array(prev_boxes[best_idx])
-                                        box = SMOOTH_ALPHA * np.array(raw_box) + (1 - SMOOTH_ALPHA) * prev
-                                        prev_boxes.pop(best_idx)
-                                    else:
-                                        box = np.array(raw_box)
-                                    new_tracked.setdefault(cid, []).append(box.tolist())
-                                    x1, y1, x2, y2 = [int(v) for v in box]
-                                    label = f"{class_names[cid]}: {(score * 100):.1f}%"
-                                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                                    cv2.putText(annotated, label, (x1, max(y1 - 10, 20)),
-                                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-                                tracked = new_tracked
+                            new_tracked: dict[int, list] = {}
+                            for det in final_detections:
+                                raw_box, score, class_id = det[:4], det[4], int(det[5])
+                                cid = class_id
+                                cx = (raw_box[0] + raw_box[2]) / 2
+                                cy = (raw_box[1] + raw_box[3]) / 2
+                                prev_boxes = tracked.get(cid, [])
+                                best_idx, best_dist = -1, float('inf')
+                                for pi, pb in enumerate(prev_boxes):
+                                    pcx = (pb[0] + pb[2]) / 2
+                                    pcy = (pb[1] + pb[3]) / 2
+                                    d = (cx - pcx) ** 2 + (cy - pcy) ** 2
+                                    if d < best_dist:
+                                        best_dist, best_idx = d, pi
+                                if best_idx >= 0 and best_dist < (FRAME_WIDTH * 0.3) ** 2:
+                                    prev = np.array(prev_boxes[best_idx])
+                                    box = SMOOTH_ALPHA * np.array(raw_box) + (1 - SMOOTH_ALPHA) * prev
+                                    prev_boxes.pop(best_idx)
+                                else:
+                                    box = np.array(raw_box)
+                                new_tracked.setdefault(cid, []).append(box.tolist())
+                                x1, y1, x2, y2 = [int(v) for v in box]
+                                label = f"{class_names[cid]}: {(score * 100):.1f}%"
+                                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                                cv2.putText(annotated, label, (x1, max(y1 - 10, 20)),
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                            tracked = new_tracked
 
-                                inference_data = {
-                                    "timestamp": get_current_timestamp(),
-                                    "detections": [
-                                        {"class": class_names[int(d[5])], "confidence": round(float(d[4]), 2), "box": [round(float(x), 1) for x in d[:4]]}
-                                        for d in final_detections
-                                    ],
-                                    "fps": round(fps, 2),
-                                    "thermal": dict(_hailo_thermal),
-                                }
-                                publish_inference_data(client, inference_data)
-                            else:
-                                tracked.clear()
-                                publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2), "thermal": dict(_hailo_thermal)})
+                            publish_inference_data(client, {
+                                "timestamp": get_current_timestamp(),
+                                "detections": [
+                                    {"class": class_names[int(d[5])], "confidence": round(float(d[4]), 2), "box": [round(float(x), 1) for x in d[:4]]}
+                                    for d in final_detections
+                                ],
+                                "fps": round(fps, 2),
+                                "thermal": dict(_hailo_thermal),
+                            })
                         else:
                             tracked.clear()
-                            publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2)})
+                            publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2), "thermal": dict(_hailo_thermal)})
 
                         if SHOW_IN_GUI:
                             cv2.imshow("Inference", annotated)
