@@ -38,7 +38,8 @@ The [wago-ai-suite](https://github.com/WagoAlex/wago-ai-suite) Visual Inference 
 ### Prerequisites
 
 - Hailo-8 PCIe module installed and recognized (`hailortcli fw-control identify`)
-- HailoRT driver `4.20.0` and Docker image `hailo_docker_hailort_ub2204:4.20.0`
+- HailoRT driver `4.20.0` - download from the [Hailo Developer Zone](https://hailo.ai/developer-zone/software-downloads/?product=ai_accelerators&device=hailo_8_8l) (free registration required)
+- Docker base image `hailo_docker_hailort_ub2204:4.20.0` - included in the HailoRT Docker package from the same download page
 - USB webcam (`/dev/video0`) or RTSP camera
 - MQTT broker reachable from the container
 
@@ -258,7 +259,7 @@ src/
 ├── mqtt_app.py         # MQTT subscriber (logging/debug - not connected to UI)
 ├── config.py           # All env-var configuration with defaults
 ├── requirements.txt    # Python dependencies
-├── Dockerfile          # Extends hailo_docker_hailort_ub2204:4.20.0
+├── Dockerfile          # Extends hailo_docker_hailort_ub2204:4.20.0 (from Hailo Developer Zone)
 ├── entrypoint.sh       # Selects webcam or rtsp mode from CMD arg
 └── yolov5m-helmet.txt  # Class label list
 ```
@@ -309,7 +310,7 @@ The queue `maxsize=2` drops frames under load to stay live. If the consumer (bro
 ## Requirements
 
 - Hailo-8 PCIe module + HailoRT driver `4.20.0`
-- Docker with access to `hailo_docker_hailort_ub2204:4.20.0` base image
+- Docker base image `hailo_docker_hailort_ub2204:4.20.0` - download from the [Hailo Developer Zone](https://hailo.ai/developer-zone/software-downloads/?product=ai_accelerators&device=hailo_8_8l) (free registration required)
 - RTSP camera(s) or USB webcam at `/dev/video0`
 - MQTT broker (Mosquitto recommended)
 
