@@ -17,7 +17,7 @@ import os
 import logging
 import threading
 from config import REST_API_PORT, SHOW_IN_GUI, FRAME_WIDTH, FRAME_HEIGHT, LOG_LEVEL
-from inference import get_hailo_metadata
+from inference import get_hailo_metadata, get_hailo_thermal
 logging.basicConfig(
     level=LOG_LEVEL,
     format='[%(levelname)s] [%(asctime)s] [%(module)s:%(lineno)d] %(message)s',
@@ -318,6 +318,7 @@ async def health_check(camera_queues: list[Queue] = Depends(get_camera_queues)):
         "status": status_msg,
         "cameras": statuses,
         "metadata": hailo_metadata,
+        "thermal": get_hailo_thermal(),
         "show_in_gui": SHOW_IN_GUI,
         "timestamp": get_current_timestamp()
     }

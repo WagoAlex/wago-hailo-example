@@ -24,11 +24,14 @@ from config import (
     MQTT_BROKER, MQTT_PORT, MQTT_TOPIC, SHOW_IN_GUI, INCLUDE_METADATA,
     MAX_CAPTURE_OPEN_RETRIES, CAPTURE_OPEN_RETRY_DELAY, MAX_READ_RETRIES,
     PLACEHOLDER_FRAME_DELAY, RTSP_RECONNECT_DELAY, RTSP_TRANSPORT,
-    IOU_THRESHOLD, NMS_IOU_THRESHOLD, USE_GSTREAMER, LOG_LEVEL, MQTT_USER, MQTT_PASS)
+    NMS_IOU_THRESHOLD, USE_GSTREAMER, LOG_LEVEL, MQTT_USER, MQTT_PASS)
 from urllib.parse import urlparse, quote
 import os
 import threading
 
+
+# Shared thermal state - written by inference loop, read by API/health
+_hailo_thermal = {"ts0": None, "ts1": None, "status": "unknown"}
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -132,6 +135,19 @@ def get_hailo_metadata() -> dict:
         logger.error(f"Failed to retrieve Hailo metadata: {e}", exc_info=True)
         return {"error": f"Failed to get Hailo metadata: {e}"}
 
+def get_hailo_thermal() -> dict:
+    """Returns latest Hailo chip temperature and status from the shared state."""
+    return dict(_hailo_thermal)
+
+def _thermal_status(ts0: float, ts1: float) -> str:
+    # ponytail: thresholds match HailoRT health monitor zones (orange=95, red=110)
+    t = max(ts0, ts1)
+    if t >= 110:
+        return "red"
+    if t >= 95:
+        return "yellow"
+    return "green"
+
 def decode_output(output, stride, anchors):
     """Decodes YOLOv5m output into bounding boxes, confidences, and class IDs."""
     if output.dtype == np.uint8:
@@ -219,17 +235,6 @@ def publish_inference_data(client, data):
         client.loop_write()  # ponytail: force socket flush instead of waiting for background loop (~100ms)
     except Exception as e:
         logger.error(f"MQTT publish failed: {type(e).__name__}")
-
-def filter_by_iou(detections, iou_threshold):
-    """Custom post-NMS IoU filter to further reduce overlapping boxes."""
-    detections = detections[detections[:, 4].argsort()[::-1]]
-    keep = []
-    for i in range(len(detections)):
-        if i in keep:
-            continue
-        iou = compute_iou(detections[i, :4], detections[i+1:, :4])
-        keep.extend([i + 1 + j for j in np.where(iou > iou_threshold)[0]])
-    return detections[[i for i in range(len(detections)) if i not in keep]]
 
 def compute_iou(box, boxes):
     """Compute IoU for one box vs many."""
@@ -326,6 +331,7 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
     logger.info(f"Output configuration built: {len(output_configs)} layers")
 
     with hpf.VDevice() as target:
+        _phys_devices = target.get_physical_devices()
         configure_params = hpf.ConfigureParams.create_from_hef(hef, interface=hpf.HailoStreamInterface.PCIe)
         network_groups = target.configure(hef, configure_params)
         network_group = network_groups[0]
@@ -617,6 +623,17 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                         fps_count += 1
                         frame_count += 1
 
+                        # ponytail: every 30 frames ~= 1-2s at 20fps; temp changes slowly
+                        if frame_count % 30 == 0 and _phys_devices:
+                            try:
+                                t = _phys_devices[0].get_chip_temperature()
+                                ts0, ts1 = t.ts0_temperature, t.ts1_temperature
+                                _hailo_thermal["ts0"] = round(ts0, 1)
+                                _hailo_thermal["ts1"] = round(ts1, 1)
+                                _hailo_thermal["status"] = _thermal_status(ts0, ts1)
+                            except Exception:
+                                pass
+
                         if current_time - fps_log_time >= 10:
                             avg_fps = fps_sum / fps_count
                             timestamp_human = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -633,62 +650,34 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                             max_confidence_window = 0.0
 
                         if filtered_detections.size > 0:
-                            indices = cv2.dnn.NMSBoxes(filtered_detections[:, :4].tolist(), filtered_detections[:, 4].tolist(), CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD)
-                            if len(indices) > 0:
-                                final_detections = filtered_detections[indices.flatten()]
-                                final_detections = filter_by_iou(final_detections, IOU_THRESHOLD)
+                            # per-class NMS then top-1: guarantees exactly one box per class
+                            # ponytail: class-agnostic NMSBoxes lets same-class duplicates survive;
+                            # running per-class then argmax is the standard YOLO post-processing fix.
+                            per_class_best = []
+                            for cid in np.unique(filtered_detections[:, 5].astype(int)):
+                                cls_dets = filtered_detections[filtered_detections[:, 5].astype(int) == cid]
+                                indices = cv2.dnn.NMSBoxes(cls_dets[:, :4].tolist(), cls_dets[:, 4].tolist(), CONFIDENCE_THRESHOLD, NMS_IOU_THRESHOLD)
+                                if len(indices):
+                                    survivors = cls_dets[indices.flatten()]
+                                    per_class_best.append(survivors[np.argmax(survivors[:, 4])])
 
-                                # centroid dedup: same object detected by multiple stride layers → keep highest confidence
-                                # ponytail: IoU alone fails across strides (32px vs 128px boxes have low IoU even on same object)
-                                final_detections = final_detections[np.argsort(final_detections[:, 4])[::-1]]
-                                keep_mask = np.ones(len(final_detections), dtype=bool)
-                                for i in range(len(final_detections)):
-                                    if not keep_mask[i]:
-                                        continue
-                                    cx_i = (final_detections[i, 0] + final_detections[i, 2]) / 2
-                                    cy_i = (final_detections[i, 1] + final_detections[i, 3]) / 2
-                                    for j in range(i + 1, len(final_detections)):
-                                        if not keep_mask[j]:
-                                            continue
-                                        cx_j = (final_detections[j, 0] + final_detections[j, 2]) / 2
-                                        cy_j = (final_detections[j, 1] + final_detections[j, 3]) / 2
-                                        dist = ((cx_i - cx_j) ** 2 + (cy_i - cy_j) ** 2) ** 0.5
-                                        if dist < FRAME_WIDTH * 0.25:  # ponytail: 25%=160px catches same-toy multi-class (helmet+head on playmobil)
-                                            keep_mask[j] = False
-                                final_detections = final_detections[keep_mask]
-
-                                # ponytail: top-1 per class - model fires on multiple non-overlapping grid cells
-                                # for the same physical object; IoU-NMS can't suppress 0-overlap boxes.
-                                # Different classes still produce separate boxes (red+blue = 2 boxes).
-                                seen_classes: dict[int, np.ndarray] = {}
-                                for det in final_detections:  # already sorted conf desc
-                                    cid = int(det[5])
-                                    if cid not in seen_classes:
-                                        seen_classes[cid] = det
-                                final_detections = np.array(list(seen_classes.values())) if seen_classes else np.zeros((0, 6))
-
-                                # ponytail: class-agnostic NMS - multiple classes fire on same object
-                                # (red+yellow+blue helmet all on same playmobil). Keep highest-conf per spatial region.
+                            if per_class_best:
+                                final_detections = np.array(per_class_best)
+                                # class-agnostic overlap pass: different classes on the same object → keep highest conf
+                                # ponytail: IoU>0.3 = meaningful spatial overlap, not two people standing apart
                                 if len(final_detections) > 1:
                                     final_detections = final_detections[np.argsort(final_detections[:, 4])[::-1]]
                                     keep = np.ones(len(final_detections), dtype=bool)
                                     for i in range(len(final_detections)):
                                         if not keep[i]:
                                             continue
-                                        for j in range(i + 1, len(final_detections)):
-                                            if not keep[j]:
-                                                continue
-                                            b1, b2 = final_detections[i, :4], final_detections[j, :4]
-                                            ix1, iy1 = max(b1[0], b2[0]), max(b1[1], b2[1])
-                                            ix2, iy2 = min(b1[2], b2[2]), min(b1[3], b2[3])
-                                            inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
-                                            union = (b1[2]-b1[0])*(b1[3]-b1[1]) + (b2[2]-b2[0])*(b2[3]-b2[1]) - inter
-                                            if union > 0 and inter / union > 0.1:  # ponytail: 0.1=any meaningful overlap merges; 2 people far apart have IoU≈0
-                                                keep[j] = False
+                                        iou = compute_iou(final_detections[i, :4], final_detections[i+1:, :4])
+                                        for j, ov in enumerate(iou):
+                                            if ov > NMS_IOU_THRESHOLD:
+                                                keep[i + 1 + j] = False
                                     final_detections = final_detections[keep]
-
-                                if len(final_detections) > 10:
-                                    final_detections = final_detections[:10]
+                            else:
+                                final_detections = np.zeros((0, 6))
 
                                 num_dets = len(final_detections)
                                 detection_count_total += num_dets
@@ -734,12 +723,13 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None):
                                         {"class": class_names[int(d[5])], "confidence": round(float(d[4]), 2), "box": [round(float(x), 1) for x in d[:4]]}
                                         for d in final_detections
                                     ],
-                                    "fps": round(fps, 2)
+                                    "fps": round(fps, 2),
+                                    "thermal": dict(_hailo_thermal),
                                 }
                                 publish_inference_data(client, inference_data)
                             else:
                                 tracked.clear()
-                                publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2)})
+                                publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2), "thermal": dict(_hailo_thermal)})
                         else:
                             tracked.clear()
                             publish_inference_data(client, {"timestamp": get_current_timestamp(), "detections": [], "fps": round(fps, 2)})
