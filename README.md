@@ -244,7 +244,8 @@ Published to `inference/yolov5m-results` after every processed frame:
   "thermal": {
     "ts0": 87.4,
     "ts1": 86.1,
-    "status": "green"
+    "status": "green",
+    "throttling": false
   }
 }
 ```
@@ -258,6 +259,7 @@ Published to `inference/yolov5m-results` after every processed frame:
 | `detections[].box` | float[4] | `[x1, y1, x2, y2]` in 640x640 pixel space |
 | `thermal.ts0` / `ts1` | float | Hailo chip temperature in °C from both internal sensors |
 | `thermal.status` | string | `green` <95°C, `yellow` 95-110°C, `red` >=110°C (health monitor red zone) |
+| `thermal.throttling` | bool | `true` when inference is paused due to thermal throttle (>=110°C); clears only after both sensors drop below 95°C |
 
 > [!IMPORTANT]
 > The field name is `box`, not `bbox`. The wago-ai-suite frontend validates this field name explicitly - a mismatch silently drops all detections.

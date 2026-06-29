@@ -31,7 +31,7 @@ import threading
 
 
 # Shared thermal state - written by inference loop, read by API/health
-_hailo_thermal = {"ts0": None, "ts1": None, "status": "unknown"}
+_hailo_thermal = {"ts0": None, "ts1": None, "status": "unknown", "throttling": False}
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -139,12 +139,15 @@ def get_hailo_thermal() -> dict:
     """Returns latest Hailo chip temperature and status from the shared state."""
     return dict(_hailo_thermal)
 
+_THERMAL_WARN = 95.0    # yellow zone start
+_THERMAL_THROTTLE = 110.0  # red zone / inference pause threshold
+
 def _thermal_status(ts0: float, ts1: float) -> str:
     # ponytail: thresholds match HailoRT health monitor zones (orange=95, red=110)
     t = max(ts0, ts1)
-    if t >= 110:
+    if t >= _THERMAL_THROTTLE:
         return "red"
-    if t >= 95:
+    if t >= _THERMAL_WARN:
         return "yellow"
     return "green"
 
@@ -332,6 +335,7 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None, therma
 
     with hpf.VDevice() as target:
         _phys_devices = target.get_physical_devices()
+        logger.info(f"Physical devices: {_phys_devices}")
         configure_params = hpf.ConfigureParams.create_from_hef(hef, interface=hpf.HailoStreamInterface.PCIe)
         network_groups = target.configure(hef, configure_params)
         network_group = network_groups[0]
@@ -626,15 +630,32 @@ def run_inference_main(use_webcam=False, frame_queue=None, rtsp_url=None, therma
                         # ponytail: every 30 frames ~= 1-2s at 20fps; temp changes slowly
                         if frame_count % 30 == 0 and _phys_devices:
                             try:
-                                t = _phys_devices[0].get_chip_temperature()
+                                t = _phys_devices[0].control.get_chip_temperature()
                                 ts0, ts1 = t.ts0_temperature, t.ts1_temperature
+                                was_throttling = _hailo_thermal["throttling"]
+                                # start throttling when ts1 >= 110; recover only when both drop below 95
+                                now_throttling = (
+                                    max(ts0, ts1) >= _THERMAL_THROTTLE
+                                    or (was_throttling and max(ts0, ts1) >= _THERMAL_WARN)
+                                )
                                 _hailo_thermal["ts0"] = round(ts0, 1)
                                 _hailo_thermal["ts1"] = round(ts1, 1)
                                 _hailo_thermal["status"] = _thermal_status(ts0, ts1)
+                                _hailo_thermal["throttling"] = now_throttling
                                 if thermal_state is not None:
                                     thermal_state.update(_hailo_thermal)
-                            except Exception:
-                                pass
+                                if max(ts0, ts1) >= _THERMAL_WARN and not now_throttling:
+                                    logger.warning(f"Hailo thermal WARNING: ts0={ts0:.1f}°C ts1={ts1:.1f}°C - approaching throttle threshold")
+                                if now_throttling and not was_throttling:
+                                    logger.error(f"Hailo thermal THROTTLE: ts0={ts0:.1f}°C ts1={ts1:.1f}°C - pausing inference until temp drops below {_THERMAL_WARN}°C")
+                                elif was_throttling and not now_throttling:
+                                    logger.info(f"Hailo thermal recovered: ts0={ts0:.1f}°C ts1={ts1:.1f}°C - resuming inference")
+                                if now_throttling:
+                                    logger.warning(f"Inference paused (thermal throttle): {max(ts0, ts1):.1f}°C")
+                                    time.sleep(5.0)
+                                    continue
+                            except Exception as e:
+                                logger.warning(f"Chip temperature read failed: {type(e).__name__}: {e}")
 
                         if current_time - fps_log_time >= 10:
                             avg_fps = fps_sum / fps_count
