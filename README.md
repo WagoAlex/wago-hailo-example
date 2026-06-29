@@ -43,13 +43,98 @@ The [wago-ai-suite](https://github.com/WagoAlex/wago-ai-suite) Visual Inference 
 - USB webcam (`/dev/video0`) or RTSP camera
 - MQTT broker reachable from the container
 
-### 1. Build
+### 1. Run with Docker Compose (recommended)
+
+Save as `docker-compose.yml` and run `docker compose up -d`:
+
+```yaml
+version: '3.8'
+
+services:
+  hailo-ai:
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: 4G
+        reservations:
+          cpus: '2.0'
+          memory: 2G
+
+    image: wagoalex/wago-hailo:yolov5-latest
+    container_name: hailo-inference
+    privileged: true
+    network_mode: host
+    ipc: host
+
+    entrypoint: ["/bin/bash", "entrypoint.sh", "webcam"]
+
+    environment:
+      CONFIDENCE_THRESHOLD: "0.65"
+      NMS_IOU_THRESHOLD: "0.30"
+      MQTT_BROKER: "127.0.0.1"
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: "inference/yolov5m-results"
+      HEF_PATH: "/local/workspace/yolov5m-helmet-wago_20251014_183320.hef"
+      WEBCAM_INDEX: "0"
+      FRAME_WIDTH: "640"
+      FRAME_HEIGHT: "640"
+      FRAME_MAX: "0.3"
+      SHOW_IN_GUI: "0"
+      DISPLAY: ":99"
+      LOG_LEVEL: "INFO"
+      INCLUDE_METADATA: "0"
+      USE_GSTREAMER: "0"
+      HLS_TIME: "2"
+      HLS_LIST_SIZE: "60"
+      HLS_FLAGS: "independent_segments+append_list+delete_segments+omit_endlist"
+      FRAME_RATE: "8"
+      FFMPEG_PRESET: "veryfast"
+      MAX_CAPTURE_OPEN_RETRIES: "20"
+      CAPTURE_OPEN_RETRY_DELAY: "3.0"
+      MAX_READ_RETRIES: "10"
+      PLACEHOLDER_FRAME_DELAY: "0.7"
+      QUEUE_WARN_THRESHOLD: "20"
+      QUEUE_DROP_THRESHOLD: "500"
+      QT_QPA_PLATFORM: xcb
+      XDG_RUNTIME_DIR: "/run/user/0"
+
+    volumes:
+      - /tmp/.X11-unix/:/tmp/.X11-unix/
+      - /root/.Xauthority:/root/.Xauthority:ro
+      - /lib/firmware:/lib/firmware
+      - /docker/tests/:/local/workspace/share:rw
+
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+
+    group_add:
+      - 44
+
+    tty: true
+    stdin_open: true
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8042/health"]
+      interval: 120s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+### 2. Or build from source
 
 ```bash
 docker build -t wago-hailo-example .
 ```
-
-### 2. Run
 
 **Webcam:**
 
@@ -62,23 +147,12 @@ docker run --rm \
   wago-hailo-example webcam
 ```
 
-**Single RTSP camera:**
+**RTSP camera:**
 
 ```bash
 docker run --rm \
   --device /dev/hailo0 \
   -e RTSP_URL=rtsp://user:pass@192.168.2.189:554/stream \
-  -e MQTT_BROKER=192.168.2.181 \
-  -p 8042:8042 \
-  wago-hailo-example rtsp
-```
-
-**Multiple RTSP cameras:**
-
-```bash
-docker run --rm \
-  --device /dev/hailo0 \
-  -e RTSP_URLS="rtsp://192.168.2.189:554/stream1,rtsp://192.168.2.190:554/stream2" \
   -e MQTT_BROKER=192.168.2.181 \
   -p 8042:8042 \
   wago-hailo-example rtsp
@@ -166,7 +240,12 @@ Published to `inference/yolov5m-results` after every processed frame:
       "confidence": 0.91,
       "box": [120.0, 45.0, 310.0, 280.0]
     }
-  ]
+  ],
+  "thermal": {
+    "ts0": 87.4,
+    "ts1": 86.1,
+    "status": "green"
+  }
 }
 ```
 
@@ -177,6 +256,8 @@ Published to `inference/yolov5m-results` after every processed frame:
 | `detections[].class` | string | Label from `yolov5m-helmet.txt` |
 | `detections[].confidence` | float | 0.0-1.0, already filtered by `CONFIDENCE_THRESHOLD` |
 | `detections[].box` | float[4] | `[x1, y1, x2, y2]` in 640x640 pixel space |
+| `thermal.ts0` / `ts1` | float | Hailo chip temperature in °C from both internal sensors |
+| `thermal.status` | string | `green` <95°C, `yellow` 95-110°C, `red` >=110°C (health monitor red zone) |
 
 > [!IMPORTANT]
 > The field name is `box`, not `bbox`. The wago-ai-suite frontend validates this field name explicitly - a mismatch silently drops all detections.
@@ -232,9 +313,8 @@ The wago-ai-suite backend proxies both endpoints - the frontend never calls them
 | `MQTT_TOPIC` | `inference/yolov5m-results` | Topic where detection JSON is published |
 | `MQTT_USER` / `MQTT_PASS` | _(empty)_ | MQTT credentials |
 | `REST_API_PORT` | `8042` | FastAPI listen port |
-| `CONFIDENCE_THRESHOLD` | `0.70` | Minimum detection score published to MQTT |
-| `IOU_THRESHOLD` | `0.15` | Post-NMS IoU filter - suppresses duplicate boxes per object |
-| `NMS_IOU_THRESHOLD` | `0.15` | IoU threshold for `cv2.dnn.NMSBoxes` |
+| `CONFIDENCE_THRESHOLD` | `0.65` | Minimum detection score; noise floor is ~0.43-0.64, valid detections 0.88+ |
+| `NMS_IOU_THRESHOLD` | `0.30` | Per-class NMS IoU threshold and cross-class overlap suppression |
 | `FRAME_WIDTH` / `FRAME_HEIGHT` | `640` | Inference input dimensions |
 | `FRAME_MAX` | `0.5` | Maximum detection box size as fraction of frame |
 | `USE_GSTREAMER` | `1` | `1` = GStreamer pipeline, `0` = FFmpeg only |
@@ -245,7 +325,7 @@ The wago-ai-suite backend proxies both endpoints - the frontend never calls them
 | `LOG_LEVEL` | `INFO` | Logging verbosity: `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 
 > [!TIP]
-> `CONFIDENCE_THRESHOLD=0.70` is calibrated for this model: valid detections score 88-93%, noise peaks at 60-65%. Lower it only if you're using a different model.
+> `CONFIDENCE_THRESHOLD=0.65` is calibrated for this model: valid detections score 88-99%, noise peaks at 43-64%. Lower it only if you're using a different model.
 
 ---
 
