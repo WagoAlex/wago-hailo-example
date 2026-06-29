@@ -41,6 +41,9 @@ global_camera_queues = None
 ffmpeg_processes = {}
 feeders = {}
 stderr_loggers = {}
+# ponytail: latest_frames lets MJPEG read independently of HLS; both share the queue but
+# MJPEG never competes for frames - it just reads whatever the HLS feeder last wrote.
+latest_frames: dict[int, bytes] = {}
 def get_current_timestamp():
     return int(datetime.utcnow().timestamp() * 1000)
 @app.get("/metadata")
@@ -149,6 +152,8 @@ def start_hls(camera_id: int, frame_queue: Queue):
                 with frame_lock:
                     last_frame = frame.copy()
                 local_last_frame = last_frame
+                _, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                latest_frames[camera_id] = jpg.tobytes()
                 frame_counter += 1
                 current_time = time.time()
                 if frame_counter % 100 == 0 or (current_time - last_log_time) > 10:
@@ -255,25 +260,18 @@ async def video_feed(camera_id: int = 0, camera_queues: list[Queue] = Depends(ge
         raise HTTPException(status_code=500, detail=f"Internal error in video stream: {str(e)}. Check container logs for traceback.")
 @app.get("/stream/mjpeg/{camera_id}")
 async def mjpeg_stream(camera_id: int):
-    queues = global_camera_queues
-    if not queues or camera_id >= len(queues):
+    if not global_camera_queues or camera_id >= len(global_camera_queues):
         raise HTTPException(status_code=404, detail="Camera not found")
-    q = queues[camera_id]
     async def generate():
-        loop = asyncio.get_event_loop()
-        # drain any stale frames so first frame shown is live
+        # ponytail: read latest_frames written by HLS feeder - no queue competition
+        last_sent = None
         while True:
-            try:
-                q.get_nowait()
-            except Exception:
-                break
-        while True:
-            try:
-                frame = await loop.run_in_executor(None, lambda: q.get(timeout=0.05))
-            except Exception:
-                continue
-            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
+            jpg = latest_frames.get(camera_id)
+            if jpg and jpg is not last_sent:
+                last_sent = jpg
+                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n'
+            else:
+                await asyncio.sleep(0.033)
     return StreamingResponse(generate(), media_type='multipart/x-mixed-replace; boundary=frame')
 
 @app.get("/video/{segment_name:path}")
