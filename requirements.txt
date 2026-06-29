@@ -1,0 +1,9 @@
+fastapi>=0.115.8,<0.120
+uvicorn>=0.34.0,<0.40
+paho-mqtt>=2.1.0,<3.0
+numpy>=1.25.2,<2.0
+opencv-python>=4.10.0.84,<5.0
+scipy>=1.10.0,<2.0
+python-multipart
+psutil
+ffmpeg-python

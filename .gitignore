@@ -1,0 +1,13 @@
+graphify-out/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.hef
+*.onnx
+*.jpeg
+*.jpg
+*.png
+hailo-sources/
+hef/
+onnx/
